@@ -3,6 +3,8 @@ name = "full-duplex-async-copy"
 version = "0.1.0"
 authors = ["Jacob Rothstein <hi@jbr.me>"]
 edition = "2018"
+description = "utility crate for bidirectionally copying between two AsyncRead+AsyncWrite types"
+license = "MIT OR Apache-2.0"
 
 [dependencies]
 futures-lite = "1.11.3"
