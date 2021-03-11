@@ -1,0 +1,10 @@
+[package]
+name = "full-duplex-async-copy"
+version = "0.1.0"
+authors = ["Jacob Rothstein <hi@jbr.me>"]
+edition = "2018"
+
+[dependencies]
+futures-lite = "1.11.3"
+fastrand = "1.4.0"
+pin-project-lite = "0.2.4"
