@@ -10,3 +10,6 @@ license = "MIT OR Apache-2.0"
 futures-lite = "1.11.3"
 fastrand = "1.4.0"
 pin-project-lite = "0.2.4"
+
+[dev-dependencies]
+spin_on = "0.1.1"
