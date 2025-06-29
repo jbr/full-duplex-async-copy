@@ -7,6 +7,9 @@ description = "utility crate for bidirectionally copying between two AsyncRead+A
 license = "MIT OR Apache-2.0"
 
 [dependencies]
-futures-lite = "1.11.3"
-fastrand = "1.4.0"
+futures-lite = "2.6.0"
+fastrand = "2.3.0"
 pin-project-lite = "0.2.4"
+
+[dev-dependencies]
+spin_on = "0.1.1"
