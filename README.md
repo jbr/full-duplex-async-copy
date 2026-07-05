@@ -15,33 +15,21 @@
 [codecov]: https://codecov.io/gh/jbr/full-duplex-async-copy
 
 Concurrently copy bytes in both directions between two `AsyncRead + AsyncWrite` transports until
-both reach EOF, resolving to the number of bytes copied in each direction. Think
-[`tokio::io::copy_bidirectional`](https://docs.rs/tokio/latest/tokio/io/fn.copy_bidirectional.html),
-but for [`futures-io`](https://docs.rs/futures-io) / [`futures-lite`](https://docs.rs/futures-lite)
-transports and with explicit, per-endpoint control over half-close behavior.
+both reach EOF, resolving to the number of bytes copied in each direction. It supports **half-closed**
+connections: when one direction reaches EOF, that read half stops and the peer's write half is shut
+down (forwarding the close as a FIN), while the opposite direction keeps relaying until it too
+reaches EOF.
 
-When one direction reaches EOF, you choose whether that close is propagated to the peer's write
-half:
-
-- `Close::Propagate` — shut the peer's write half down, forwarding the close as a FIN (the behavior
-  of a plain byte-stream proxy, and of `tokio::io::copy_bidirectional`).
-- `Close::Contain` — leave the peer's write half open, so a one-sided close is not escalated into a
-  full teardown. Required for peers that treat an incoming FIN as a full close.
-
-There is deliberately no default: the caller chooses a policy for each side.
+Built for [`futures-io`](https://docs.rs/futures-io) /
+[`futures-lite`](https://docs.rs/futures-lite) transports.
 
 ## Example
 
 ```rust
-use full_duplex_async_copy::{Close, full_duplex_copy};
+use full_duplex_async_copy::full_duplex_copy;
 
 // `a` and `b` are two transports to relay between — e.g. two TCP connections to proxy.
-// Each side decides whether its close propagates to the peer. Here both propagate, tokio-style:
-let (a_to_b, b_to_a) = full_duplex_copy(Close::Propagate(a), Close::Propagate(b)).await?;
-
-// To preserve a half-open connection instead (e.g. one side is an upgraded protocol that
-// treats a FIN as a full close), contain that side's close:
-let (a_to_b, b_to_a) = full_duplex_copy(Close::Contain(a), Close::Propagate(b)).await?;
+let (a_to_b, b_to_a) = full_duplex_copy(a, b).await?;
 ```
 
 ## Safety

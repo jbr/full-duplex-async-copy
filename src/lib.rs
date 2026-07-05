@@ -13,21 +13,11 @@
 //!
 //! [`full_duplex_copy`] relays bytes in both directions concurrently until *both* directions
 //! reach EOF, then resolves to the number of bytes copied in each direction. It supports
-//! **half-closed** connections: when one direction reaches EOF, that direction stops but the
-//! opposite direction keeps relaying.
+//! **half-closed** connections: when one direction reaches EOF, that read half stops and the
+//! peer's write half is shut down ([`poll_close`][AsyncWrite::poll_close]), forwarding the close
+//! as a FIN, while the opposite direction keeps relaying until it too reaches EOF.
 //!
-//! Each transport is wrapped in a [`Close`] that says, when this transport's read half reaches
-//! EOF, whether that close is propagated to the *peer's* write half:
-//!
-//! - [`Close::Propagate`] shuts the peer's write half down
-//!   ([`poll_close`][AsyncWrite::poll_close]), forwarding the close as a FIN — the behavior of a
-//!   plain byte-stream proxy and of
-//!   [`tokio::io::copy_bidirectional`](https://docs.rs/tokio/latest/tokio/io/fn.copy_bidirectional.html).
-//! - [`Close::Contain`] leaves the peer's write half open, keeping the one-sided close from
-//!   escalating into a full teardown. This is required for peers that treat an incoming FIN as a
-//!   full close.
-//!
-//! There is deliberately no default: the caller must choose a policy for each side.
+//! Built for the [`futures_lite`] / `futures-io` [`AsyncRead`] + [`AsyncWrite`] traits.
 //!
 //! ```
 //! # use futures_lite::io::{AsyncRead, AsyncWrite, Cursor};
@@ -46,13 +36,13 @@
 //! #     fn poll_flush(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<io::Result<()>> { Poll::Ready(Ok(())) }
 //! #     fn poll_close(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<io::Result<()>> { Poll::Ready(Ok(())) }
 //! # }
-//! use full_duplex_async_copy::{Close, full_duplex_copy};
+//! use full_duplex_async_copy::full_duplex_copy;
 //!
 //! # futures_lite::future::block_on(async {
 //! // `a` and `b` are your two transports — e.g. two TCP connections to proxy between.
 //! # let a = Duplex::new(b"hello");
 //! # let b = Duplex::new(b"world!");
-//! let (a_to_b, b_to_a) = full_duplex_copy(Close::Propagate(a), Close::Propagate(b)).await?;
+//! let (a_to_b, b_to_a) = full_duplex_copy(a, b).await?;
 //! assert_eq!((a_to_b, b_to_a), (5, 6));
 //! # std::io::Result::Ok(())
 //! # }).unwrap();
@@ -73,58 +63,26 @@ use std::{
     },
 };
 
-/// A transport paired with a policy for how its close is handled when its read half reaches EOF.
-///
-/// The policy travels with the transport whose read half hits EOF and decides the fate of the
-/// *other* transport's write half. For example, when the read half of the transport in
-/// `Close::Contain(a)` reaches EOF, the peer's write half is left open (the close is contained to
-/// this side); with `Close::Propagate(a)` it is shut down, forwarding the close.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum Close<T> {
-    /// When this transport's read half reaches EOF, propagate the close to the peer by shutting
-    /// down its write half ([`poll_close`][AsyncWrite::poll_close]), forwarding the FIN.
-    Propagate(T),
-
-    /// When this transport's read half reaches EOF, contain the close to this side and leave the
-    /// peer's write half open. The peer is closed only when its own read half reaches EOF and both
-    /// transports are dropped after the copy completes. Use this for peers that treat an incoming
-    /// FIN as a full close.
-    Contain(T),
-}
-
-impl<T> Close<T> {
-    /// Splits into the wrapped transport and whether its EOF should close the peer.
-    fn into_parts(self) -> (T, bool) {
-        match self {
-            Close::Propagate(inner) => (inner, true),
-            Close::Contain(inner) => (inner, false),
-        }
-    }
-}
-
 /// Bidirectionally copy between two `AsyncRead + AsyncWrite` transports until both reach EOF.
 ///
-/// Bytes are relayed in both directions concurrently. When one direction reaches EOF it stops,
-/// while the opposite direction keeps going. Each transport is wrapped in a [`Close`] choosing
-/// whether its EOF propagates the close to the peer ([`Close::Propagate`]) or contains it, leaving
-/// the peer's write half open ([`Close::Contain`]). The returned future resolves once *both*
-/// directions have reached EOF, yielding `(bytes copied a → b, bytes copied b → a)`.
+/// Bytes are relayed in both directions concurrently. When one direction reaches EOF it stops and
+/// the peer's write half is shut down ([`poll_close`][AsyncWrite::poll_close]), forwarding the
+/// close as a FIN, while the opposite direction keeps relaying. The returned future resolves once
+/// *both* directions have reached EOF, yielding `(bytes copied a → b, bytes copied b → a)`.
 ///
 /// # Errors
 ///
 /// Resolves to any I/O error produced by a read or write on either transport, as soon as it
 /// occurs. Some in-flight data may be lost when that happens. A write that accepts zero bytes is
 /// reported as [`ErrorKind::WriteZero`].
-pub async fn full_duplex_copy<A, B>(a: Close<A>, b: Close<B>) -> Result<(u64, u64)>
+pub async fn full_duplex_copy<A, B>(a: A, b: B) -> Result<(u64, u64)>
 where
     A: AsyncRead + AsyncWrite,
     B: AsyncRead + AsyncWrite,
 {
-    let (a, a_close_peer) = a.into_parts();
-    let (b, b_close_peer) = b.into_parts();
     FullDuplexCopy {
-        a: FullDuplexInner::new(a, a_close_peer),
-        b: FullDuplexInner::new(b, b_close_peer),
+        a: FullDuplexInner::new(a),
+        b: FullDuplexInner::new(b),
         a_first: true,
     }
     .await
@@ -148,8 +106,6 @@ pin_project! {
         #[pin]
         inner: BufReader<R>,
         done: bool,
-        // Whether reaching EOF on this transport should close the peer's write half.
-        close_peer_on_eof: bool,
         bytes_read: u64,
     }
 }
@@ -158,11 +114,10 @@ impl<R> FullDuplexInner<R>
 where
     R: AsyncRead,
 {
-    fn new(inner: R, close_peer_on_eof: bool) -> Self {
+    fn new(inner: R) -> Self {
         Self {
             inner: BufReader::new(inner),
             done: false,
-            close_peer_on_eof,
             bytes_read: 0,
         }
     }
@@ -170,8 +125,8 @@ where
     /// Reads from this transport and writes into `target` (the peer).
     ///
     /// Returns `Ready(false)` after making forward progress (bytes copied), `Ready(true)` once
-    /// this read half has reached EOF and any close policy has been applied, and `Pending` when
-    /// neither could proceed.
+    /// this read half has reached EOF and the peer's write half has been shut down, and `Pending`
+    /// when neither could proceed.
     fn poll_copy<Target>(
         self: Pin<&mut Self>,
         mut target: Pin<&mut Target>,
@@ -188,14 +143,10 @@ where
 
         if buffer.is_empty() {
             // This read half reached EOF. Flush whatever we've already written to the peer, then
-            // apply this side's close policy: `Close::Propagate` shuts the peer's write half down,
-            // forwarding the close, while `Close::Contain` leaves it open so a one-sided close is
-            // not escalated into a full teardown. Either way the opposite direction keeps relaying
-            // until it too reaches EOF.
+            // shut its write half down, forwarding the close as a FIN. The opposite direction
+            // keeps relaying until it too reaches EOF.
             ready!(target.as_mut().poll_flush(cx))?;
-            if *this.close_peer_on_eof {
-                ready!(target.as_mut().poll_close(cx))?;
-            }
+            ready!(target.as_mut().poll_close(cx))?;
             *this.done = true;
             Ready(Ok(true))
         } else {

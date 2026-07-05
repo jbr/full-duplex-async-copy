@@ -5,7 +5,7 @@
 //! handed to the copy. Whatever a transport writes is readable from its peer, and either half of
 //! either connection can be closed independently — enough to exercise half-open states.
 
-use full_duplex_async_copy::{Close, full_duplex_copy};
+use full_duplex_async_copy::full_duplex_copy;
 use futures_lite::io::{AsyncRead, AsyncReadExt, AsyncWrite};
 use std::{
     io,
@@ -47,10 +47,6 @@ impl CloseableCursor {
         if let Some(waker) = inner.waker.take() {
             waker.wake();
         }
-    }
-
-    fn snapshot(&self) -> Vec<u8> {
-        self.0.read().unwrap().data.clone()
     }
 }
 
@@ -141,11 +137,6 @@ impl TestTransport {
         self.read.close();
     }
 
-    /// Everything delivered to our reader so far.
-    fn received(&self) -> Vec<u8> {
-        self.read.snapshot()
-    }
-
     /// Read exactly `n` bytes.
     async fn recv_exact(&self, n: usize) -> Vec<u8> {
         let mut buf = vec![0; n];
@@ -208,10 +199,7 @@ fn bidirectional_roundtrip() {
     smol::block_on(async {
         let (client, proxy_a) = TestTransport::pair();
         let (proxy_b, server) = TestTransport::pair();
-        let copy = smol::spawn(full_duplex_copy(
-            Close::Propagate(proxy_a),
-            Close::Propagate(proxy_b),
-        ));
+        let copy = smol::spawn(full_duplex_copy(proxy_a, proxy_b));
 
         client.send(b"ping");
         assert_eq!(server.recv_exact(4).await, b"ping");
@@ -230,10 +218,7 @@ fn empty_both_sides_completes() {
     smol::block_on(async {
         let (client, proxy_a) = TestTransport::pair();
         let (proxy_b, server) = TestTransport::pair();
-        let copy = smol::spawn(full_duplex_copy(
-            Close::Propagate(proxy_a),
-            Close::Propagate(proxy_b),
-        ));
+        let copy = smol::spawn(full_duplex_copy(proxy_a, proxy_b));
 
         client.close_write();
         server.close_write();
@@ -246,10 +231,7 @@ fn single_direction_transfer() {
     smol::block_on(async {
         let (client, proxy_a) = TestTransport::pair();
         let (proxy_b, server) = TestTransport::pair();
-        let copy = smol::spawn(full_duplex_copy(
-            Close::Propagate(proxy_a),
-            Close::Propagate(proxy_b),
-        ));
+        let copy = smol::spawn(full_duplex_copy(proxy_a, proxy_b));
 
         client.send(b"only one way");
         client.close_write();
@@ -265,10 +247,7 @@ fn large_payloads_both_directions() {
     smol::block_on(async {
         let (client, proxy_a) = TestTransport::pair();
         let (proxy_b, server) = TestTransport::pair();
-        let copy = smol::spawn(full_duplex_copy(
-            Close::Propagate(proxy_a),
-            Close::Propagate(proxy_b),
-        ));
+        let copy = smol::spawn(full_duplex_copy(proxy_a, proxy_b));
 
         // Both well past the 8 KiB internal BufReader, so many fill/write cycles are exercised.
         let up: Vec<u8> = (0..200_000u32).map(|i| (i % 251) as u8).collect();
@@ -285,29 +264,24 @@ fn large_payloads_both_directions() {
     });
 }
 
-/// `Close::Contain`: when one side stops sending, the peer's write half stays open, so the opposite
-/// direction keeps relaying. The copy completes only once *both* directions have reached EOF.
+/// A half-closed connection keeps relaying the opposite direction: after the client hangs up its
+/// send side, the server can still reach the client, and the copy completes only once *both*
+/// directions have reached EOF. This is the half-open case that motivated the fix.
 #[test]
-fn half_close_keeps_peer_writable() {
+fn half_close_keeps_reverse_direction_flowing() {
     smol::block_on(async {
         let (client, proxy_a) = TestTransport::pair();
         let (proxy_b, server) = TestTransport::pair();
-        let copy = smol::spawn(full_duplex_copy(
-            Close::Contain(proxy_a),
-            Close::Contain(proxy_b),
-        ));
+        let copy = smol::spawn(full_duplex_copy(proxy_a, proxy_b));
 
         client.send(b"hello");
         assert_eq!(server.recv_exact(5).await, b"hello");
 
-        // The client half-closes its send side. With `Close::Contain` this must NOT tear down the
-        // server, so the server can still reach the client.
+        // The client half-closes its send side. The opposite (server -> client) direction must
+        // keep relaying rather than tearing down or hanging.
         client.close_write();
         server.send(b"world");
         assert_eq!(client.recv_exact(5).await, b"world");
-
-        // Nothing was propagated to the server's reader.
-        assert_eq!(server.received(), b"hello");
 
         // Now the server finishes too; the copy completes with a byte count for each direction.
         server.close_write();
@@ -315,23 +289,20 @@ fn half_close_keeps_peer_writable() {
     });
 }
 
-/// `Close::Propagate`: when one side reaches EOF, the peer's write half is shut down, propagating
-/// the close (the reader on the far end observes EOF).
+/// When one side reaches EOF, the peer's write half is shut down, forwarding the close: the reader
+/// on the far end observes EOF.
 #[test]
-fn full_close_propagates_eof_to_peer() {
+fn eof_propagates_to_peer() {
     smol::block_on(async {
         let (client, proxy_a) = TestTransport::pair();
         let (proxy_b, server) = TestTransport::pair();
-        let copy = smol::spawn(full_duplex_copy(
-            Close::Propagate(proxy_a),
-            Close::Propagate(proxy_b),
-        ));
+        let copy = smol::spawn(full_duplex_copy(proxy_a, proxy_b));
 
         client.send(b"hello");
         assert_eq!(server.recv_exact(5).await, b"hello");
 
-        // Client hangs up. `Close::Propagate` closes the server-facing write half, so the server
-        // now sees EOF on its reader.
+        // Client hangs up; the server-facing write half is closed, so the server now sees EOF on
+        // its reader.
         client.close_write();
         assert_eq!(server.read_once().await, 0);
 
@@ -347,10 +318,7 @@ fn write_to_closed_peer_errors() {
     smol::block_on(async {
         let (client, proxy_a) = TestTransport::pair();
         let (proxy_b, server) = TestTransport::pair();
-        let copy = smol::spawn(full_duplex_copy(
-            Close::Propagate(proxy_a),
-            Close::Propagate(proxy_b),
-        ));
+        let copy = smol::spawn(full_duplex_copy(proxy_a, proxy_b));
 
         client.close_read(); // the client will no longer accept relayed bytes
         server.send(b"data"); // ...but the server sends some, which we must relay to the client
